@@ -189,6 +189,9 @@ struct PromPlannerContext {
     /// uses it internally (e.g. as the series key for [`SeriesDivide`]) and strips it from the
     /// final output.
     use_tsid: bool,
+    /// A nullable tag was mapped to the PromQL empty label after raw series selection.
+    /// Its raw `__tsid` no longer identifies a unique set of visible labels.
+    normalized_nullable_tags: bool,
     /// The matcher for field columns `__field__`.
     field_column_matcher: Option<Vec<Matcher>>,
     /// The matcher for selectors (normal matchers).
@@ -305,6 +308,7 @@ struct BinaryResultLabels {
     /// `__tsid` column of the operand the labels come from, when that operand contributes its
     /// whole tag set and the column still identifies the result series.
     tsid: Option<DfExpr>,
+    normalized_nullable_tags: bool,
 }
 
 impl BinaryResultLabels {
@@ -312,6 +316,7 @@ impl BinaryResultLabels {
         ctx.tag_columns = self.names.clone();
         ctx.aggregation_field_labels = self.aggregation_field_labels.clone();
         ctx.use_tsid = self.tsid.is_some();
+        ctx.normalized_nullable_tags = self.normalized_nullable_tags;
     }
 
     /// `__tsid` is projected from whichever operand the labels come from, so it carries that
@@ -417,6 +422,7 @@ impl PromPlannerContext {
         self.field_columns = vec![];
         self.tag_columns = vec![];
         self.use_tsid = false;
+        self.normalized_nullable_tags = false;
         self.field_column_matcher = None;
         self.selector_matcher.clear();
         self.schema_name = None;
@@ -428,6 +434,7 @@ impl PromPlannerContext {
         self.table_name = Some(String::new());
         self.schema_name = None;
         self.use_tsid = false;
+        self.normalized_nullable_tags = false;
     }
 
     /// Check if `le` is present in tag columns
@@ -693,6 +700,7 @@ impl PromPlanner {
 
                 let keep_tsid = op.id() != token::T_COUNT_VALUES
                     && input_has_tsid
+                    && !self.ctx.normalized_nullable_tags
                     && input_tag_columns.iter().collect::<HashSet<_>>()
                         == self.ctx.tag_columns.iter().collect::<HashSet<_>>();
 
@@ -1054,7 +1062,7 @@ impl PromPlanner {
     fn binary_island_join_contexts_supported(leaves: &[PlannedIslandLeaf]) -> bool {
         if leaves
             .iter()
-            .any(|leaf| leaf.ctx.time_index_column.is_none())
+            .any(|leaf| leaf.ctx.time_index_column.is_none() || leaf.ctx.normalized_nullable_tags)
         {
             return false;
         }
@@ -1640,6 +1648,10 @@ impl PromPlanner {
                     || has_empty_metric_operand
                     || ((left_context.tag_columns.is_empty()
                         || right_context.tag_columns.is_empty())
+                        && !matches!(
+                            modifier.as_ref().and_then(|modifier| modifier.matching.as_ref()),
+                            Some(LabelModifier::Include(on)) if !on.labels.is_empty()
+                        )
                         && !left_context
                             .tag_columns
                             .iter()
@@ -1680,6 +1692,8 @@ impl PromPlanner {
                 if let Some(labels) = &result_labels {
                     labels.apply(&mut self.ctx);
                 }
+                self.ctx.normalized_nullable_tags |=
+                    left_context.normalized_nullable_tags || right_context.normalized_nullable_tags;
                 let promql_annotations = self.promql_annotations.clone();
                 // These predicates always pass; they only evaluate otherwise-discarded pairs
                 // while collecting annotations.
@@ -1962,6 +1976,7 @@ impl PromPlanner {
         if let Some(labels) = result_labels {
             labels.apply(&mut self.ctx);
         }
+        self.ctx.normalized_nullable_tags |= context.normalized_nullable_tags;
 
         Ok(plan)
     }
@@ -2134,11 +2149,12 @@ impl PromPlanner {
         let manipulate = LogicalPlan::Extension(Extension {
             node: Arc::new(manipulate),
         });
-        if let Some(timestamp_value_column) = timestamp_value_column {
+        let selected = if let Some(timestamp_value_column) = timestamp_value_column {
             self.create_timestamp_func_plan(manipulate, &timestamp_value_column)
         } else {
             Ok(manipulate)
-        }
+        }?;
+        self.normalize_nullable_tag_labels(selected)
     }
 
     /// Builds a projection plan for the PromQL `timestamp()` function.
@@ -2228,7 +2244,7 @@ impl PromPlanner {
         )
         .context(DataFusionPlanningSnafu)?;
 
-        Ok(LogicalPlan::Extension(Extension {
+        self.normalize_nullable_tag_labels(LogicalPlan::Extension(Extension {
             node: Arc::new(manipulate),
         }))
     }
@@ -2638,6 +2654,59 @@ impl PromPlanner {
         });
 
         Ok(logical_plan)
+    }
+
+    /// PromQL has no distinct NULL label value. Keep raw tags through series selection, then
+    /// expose empty strings to grouping, matching, and result projection.
+    fn normalize_nullable_tag_labels(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        let tags = self
+            .ctx
+            .tag_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut normalized = false;
+        let exprs = plan
+            .schema()
+            .iter()
+            .map(|(qualifier, field)| {
+                let column = DfExpr::Column(Column::new(qualifier.cloned(), field.name()));
+                if !tags.contains(field.name().as_str()) || !field.is_nullable() {
+                    return Ok(column);
+                }
+
+                let value_type = Self::string_value_data_type(field.data_type())
+                    .with_context(|| UnexpectedPlanExprSnafu {
+                        desc: format!("PromQL tag {} must be a string", field.name()),
+                    })?
+                    .clone();
+                let empty = Self::string_scalar_value(&value_type, Some(String::new()))
+                    .with_context(|| UnexpectedPlanExprSnafu {
+                        desc: format!("PromQL tag {} must be a string", field.name()),
+                    })?;
+                let column = if field.data_type() == &value_type {
+                    column
+                } else {
+                    DfExpr::Cast(Cast::new(Box::new(column), value_type))
+                };
+                normalized = true;
+                Ok(DfExpr::ScalarFunction(ScalarFunction {
+                    func: coalesce(),
+                    args: vec![column, DfExpr::Literal(empty, None)],
+                })
+                .alias_qualified(qualifier.cloned(), field.name()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if !normalized {
+            return Ok(plan);
+        }
+        self.ctx.normalized_nullable_tags = true;
+        LogicalPlanBuilder::from(plan)
+            .project(exprs)
+            .context(DataFusionPlanningSnafu)?
+            .build()
+            .context(DataFusionPlanningSnafu)
     }
 
     /// Convert [LabelModifier] to [Column] exprs for aggregation.
@@ -5812,6 +5881,8 @@ impl PromPlanner {
                 .any(|field| field.name() == DATA_SCHEMA_TSID_COLUMN_NAME)
         };
         let use_tsid_join = !only_join_time_index
+            && !left_context.normalized_nullable_tags
+            && !right_context.normalized_nullable_tags
             && self.binary_modifier_preserves_tsid_join_key(left_context, right_context, modifier)
             && left_context.use_tsid
             && right_context.use_tsid
@@ -5977,6 +6048,7 @@ impl PromPlanner {
         let tsid = source_context
             .filter(|(_, context)| {
                 context.use_tsid
+                    && !context.normalized_nullable_tags
                     && context.tag_columns.len() == names.len()
                     && context.tag_columns.iter().all(|tag| names.contains(tag))
             })
@@ -5989,6 +6061,8 @@ impl PromPlanner {
             names,
             aggregation_field_labels,
             tsid,
+            normalized_nullable_tags: left_context.normalized_nullable_tags
+                || right_context.normalized_nullable_tags,
         })
     }
 
@@ -6161,7 +6235,7 @@ impl PromPlanner {
             && !force_empty_join
             && left_tag_columns == BTreeSet::from([DATA_SCHEMA_TSID_COLUMN_NAME.to_string()])
             && right_tag_columns == BTreeSet::from([DATA_SCHEMA_TSID_COLUMN_NAME.to_string()]);
-        let (left, right, left_matched_tags, right_matched_tags) = if !only_join_time_index
+        let (mut left, mut right, left_matched_tags, right_matched_tags) = if !only_join_time_index
             && !use_tsid_join
             && Self::only_temporality_match_label_mismatches(left_context, right_context, modifier)
         {
@@ -6197,8 +6271,108 @@ impl PromPlanner {
             )
         };
 
+        // A match label absent from one operand has the PromQL value "", not an impossible
+        // match. Use a private column so a value field with the same name cannot be mistaken
+        // for the missing tag.
+        let mut left_join_keys = left_tag_columns
+            .iter()
+            .map(|label| (label.clone(), label.clone()))
+            .collect::<Vec<_>>();
+        let mut right_join_keys = right_tag_columns
+            .iter()
+            .map(|label| (label.clone(), label.clone()))
+            .collect::<Vec<_>>();
+        if force_empty_join
+            && !only_join_time_index
+            && modifier
+                .as_ref()
+                .and_then(|modifier| modifier.matching.as_ref())
+                .is_some()
+        {
+            let mut selected = left_matched_tags
+                .iter()
+                .chain(&right_matched_tags)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if let Some(matching) = modifier
+                .as_ref()
+                .and_then(|modifier| modifier.matching.as_ref())
+            {
+                match matching {
+                    LabelModifier::Include(on) => {
+                        selected.retain(|label| on.labels.contains(label));
+                    }
+                    LabelModifier::Exclude(ignoring) => {
+                        selected.retain(|label| !ignoring.labels.contains(label));
+                    }
+                }
+            }
+            let mut occupied = left
+                .schema()
+                .fields()
+                .iter()
+                .chain(right.schema().fields().iter())
+                .map(|field| field.name().clone())
+                .collect::<HashSet<_>>();
+            let mut left_extra = Vec::new();
+            let mut right_extra = Vec::new();
+            let mut suffix = 0;
+            left_join_keys.clear();
+            right_join_keys.clear();
+
+            for label in selected {
+                let in_left = left_matched_tags.contains(&label);
+                let in_right = right_matched_tags.contains(&label);
+                let mut left_key = label.clone();
+                let mut right_key = label.clone();
+                if in_left != in_right {
+                    let (source, source_extra, missing_extra) = if in_left {
+                        (&left, &mut left_extra, &mut right_extra)
+                    } else {
+                        (&right, &mut right_extra, &mut left_extra)
+                    };
+                    let (qualifier, field) = source
+                        .schema()
+                        .iter()
+                        .find(|(_, field)| field.name() == &label)
+                        .with_context(|| ColumnNotFoundSnafu { col: label.clone() })?;
+                    let value_type = Self::string_value_data_type(field.data_type())
+                        .with_context(|| UnexpectedPlanExprSnafu {
+                            desc: format!("PromQL match label {label} must be a string"),
+                        })?
+                        .clone();
+                    let internal_name = loop {
+                        let name = format!("__promql_missing_match_{suffix}");
+                        suffix += 1;
+                        if occupied.insert(name.clone()) {
+                            break name;
+                        }
+                    };
+                    source_extra.push(Self::normalized_match_key_expr(
+                        &label,
+                        Some((qualifier.cloned(), field.data_type().clone())),
+                        &value_type,
+                        &internal_name,
+                    ));
+                    missing_extra.push(Self::normalized_match_key_expr(
+                        &label,
+                        None,
+                        &value_type,
+                        &internal_name,
+                    ));
+                    left_key = internal_name.clone();
+                    right_key = internal_name;
+                }
+                left_join_keys.push((label.clone(), left_key));
+                right_join_keys.push((label, right_key));
+            }
+            left = Self::project_internal_match_keys(left, left_extra)?;
+            right = Self::project_internal_match_keys(right, right_extra)?;
+            force_empty_join = false;
+        }
+
         // A join key that covers the whole tag set of a side already makes that side's match
-        // groups unique, and so does a join on `__tsid`. Only the reduced keys need the check.
+        // groups unique, unless nullable tags have collapsed onto the same PromQL label.
         let checked_matching = !only_join_time_index
             && !force_empty_join
             && !use_tsid_join
@@ -6217,10 +6391,11 @@ impl PromPlanner {
             (
                 Self::assert_unique_one_side(
                     left,
-                    &left_tag_columns,
+                    &left_join_keys,
                     &left_matched_tags,
                     left_time_index_column.as_deref(),
                     true,
+                    left_context.normalized_nullable_tags,
                 )?,
                 right,
             )
@@ -6229,10 +6404,11 @@ impl PromPlanner {
                 left,
                 Self::assert_unique_one_side(
                     right,
-                    &right_tag_columns,
+                    &right_join_keys,
                     &right_matched_tags,
                     right_time_index_column.as_deref(),
                     false,
+                    right_context.normalized_nullable_tags,
                 )?,
             )
         };
@@ -6242,8 +6418,11 @@ impl PromPlanner {
             left_time_index_column.clone(),
             right_time_index_column.clone(),
         ) {
-            left_tag_columns.insert(left_time_index_column);
-            right_tag_columns.insert(right_time_index_column);
+            left_join_keys.insert(0, (left_time_index_column.clone(), left_time_index_column));
+            right_join_keys.insert(
+                0,
+                (right_time_index_column.clone(), right_time_index_column),
+            );
         }
 
         let right = LogicalPlanBuilder::from(right)
@@ -6260,13 +6439,13 @@ impl PromPlanner {
                 right,
                 JoinType::Inner,
                 (
-                    left_tag_columns
+                    left_join_keys
                         .into_iter()
-                        .map(Column::from_name)
+                        .map(|(_, column)| Column::from_name(column))
                         .collect::<Vec<_>>(),
-                    right_tag_columns
+                    right_join_keys
                         .into_iter()
-                        .map(Column::from_name)
+                        .map(|(_, column)| Column::from_name(column))
                         .collect::<Vec<_>>(),
                 ),
                 force_empty_join.then_some(lit(false)),
@@ -6334,22 +6513,27 @@ impl PromPlanner {
     /// Guard the side of a vector matching that must hold one series per match group.
     fn assert_unique_one_side(
         plan: LogicalPlan,
-        join_keys: &BTreeSet<String>,
+        join_keys: &[(String, String)],
         tag_columns: &[String],
         time_index_column: Option<&str>,
         one_side_is_left: bool,
+        normalized_nullable_tags: bool,
     ) -> Result<LogicalPlan> {
         let Some(time_index_column) = time_index_column else {
             return Ok(plan);
         };
-        if tag_columns.iter().all(|tag| join_keys.contains(tag)) {
+        if !normalized_nullable_tags
+            && tag_columns
+                .iter()
+                .all(|tag| join_keys.iter().any(|(label, _)| label == tag))
+        {
             return Ok(plan);
         }
 
-        let group_labels = join_keys.iter().cloned().collect::<Vec<_>>();
-        let group_exprs = group_labels
+        let group_labels = join_keys.iter().map(|(label, _)| label.clone()).collect();
+        let group_exprs = join_keys
             .iter()
-            .map(|label| DfExpr::Column(Column::from_name(label)))
+            .map(|(_, column)| DfExpr::Column(Column::from_name(column)))
             .collect();
         Self::assert_unique_match_group(
             plan,
@@ -6523,6 +6707,24 @@ impl PromPlanner {
             DfExpr::Literal(empty, None)
         };
         expr.alias(internal_name)
+    }
+
+    fn project_internal_match_keys(plan: LogicalPlan, keys: Vec<DfExpr>) -> Result<LogicalPlan> {
+        if keys.is_empty() {
+            return Ok(plan);
+        }
+        let visible = plan
+            .schema()
+            .iter()
+            .map(|(qualifier, field)| {
+                DfExpr::Column(Column::new(qualifier.cloned(), field.name().clone()))
+            })
+            .collect::<Vec<_>>();
+        LogicalPlanBuilder::from(plan)
+            .project(visible.into_iter().chain(keys))
+            .context(DataFusionPlanningSnafu)?
+            .build()
+            .context(DataFusionPlanningSnafu)
     }
 
     fn is_zero_row_empty_relation(plan: &LogicalPlan) -> bool {
@@ -7372,7 +7574,9 @@ impl PromPlanner {
         } else {
             vec![output_field_col]
         };
-        output_context.use_tsid = left_has_tsid && right_has_tsid;
+        output_context.normalized_nullable_tags |= right_context.normalized_nullable_tags;
+        output_context.use_tsid =
+            left_has_tsid && right_has_tsid && !output_context.normalized_nullable_tags;
         self.ctx = output_context;
 
         Ok(result)
@@ -8401,6 +8605,13 @@ mod test {
     async fn build_test_table_provider_with_distinct_tags(
         table_tags: &[(&str, &[&str])],
     ) -> DfTableSourceProvider {
+        build_test_table_provider_with_nullable_distinct_tags(table_tags, false).await
+    }
+
+    async fn build_test_table_provider_with_nullable_distinct_tags(
+        table_tags: &[(&str, &[&str])],
+        nullable_tags: bool,
+    ) -> DfTableSourceProvider {
         let catalog_list = MemoryCatalogManager::with_default_setup();
         for (table_name, tags) in table_tags {
             let mut columns = tags
@@ -8409,7 +8620,7 @@ mod test {
                     ColumnSchema::new(
                         (*tag).to_string(),
                         ConcreteDataType::string_datatype(),
-                        false,
+                        nullable_tags,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -11532,9 +11743,9 @@ mod test {
         assert_eq!(
             actual,
             vec![
-                (1_000, None, 1.0),
+                (1_000, Some(String::new()), 1.0),
                 (1_000, Some("native".to_string()), 0.0),
-                (2_000, None, 1.0),
+                (2_000, Some(String::new()), 1.0),
                 (2_000, Some("native".to_string()), 0.0),
             ]
         );
@@ -13813,6 +14024,64 @@ Projection: count(prometheus_tsdb_head_series.greptime_value) AS my_series, prom
                 "{query}\n{plan}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn nullable_tags_are_normalized_for_promql_grouping() {
+        let provider = build_test_table_provider_with_nullable_distinct_tags(
+            &[("metric_a", &["host", "zone"])],
+            true,
+        )
+        .await;
+        let plan = PromPlanner::stmt_to_plan(
+            provider,
+            &build_eval_stmt("max by(host)(metric_a)"),
+            &build_query_engine_state(),
+        )
+        .await
+        .unwrap();
+        let display = plan.display_indent().to_string();
+        let normalization = display.find("coalesce(").expect(&display);
+        let selection = display.find("PromInstantManipulate").expect(&display);
+        assert!(normalization < selection, "{display}");
+        assert!(display.contains("PromSeriesDivide"), "{display}");
+    }
+
+    #[tokio::test]
+    async fn nullable_match_groups_are_checked_even_with_all_tags_in_key() {
+        let provider = build_test_table_provider_with_nullable_distinct_tags(
+            &[("metric_a", &["host"]), ("metric_b", &["host"])],
+            true,
+        )
+        .await;
+        let plan = PromPlanner::stmt_to_plan(
+            provider,
+            &build_eval_stmt("metric_a / on(host) group_left metric_b"),
+            &build_query_engine_state(),
+        )
+        .await
+        .unwrap();
+        let display = plan.display_indent().to_string();
+        assert!(display.contains(MATCH_GROUP_COUNT_COLUMN), "{display}");
+    }
+
+    #[tokio::test]
+    async fn missing_on_label_uses_empty_private_join_key() {
+        let provider = build_test_table_provider_with_nullable_distinct_tags(
+            &[("metric_a", &["host"]), ("metric_b", &["zone"])],
+            true,
+        )
+        .await;
+        let plan = PromPlanner::stmt_to_plan(
+            provider,
+            &build_eval_stmt("metric_a / on(host) group_left metric_b"),
+            &build_query_engine_state(),
+        )
+        .await
+        .unwrap();
+        let display = plan.display_indent().to_string();
+        assert!(display.contains("__promql_missing_match_"), "{display}");
+        assert!(!display.contains("Filter: false"), "{display}");
     }
 
     #[tokio::test]
